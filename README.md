@@ -2,6 +2,15 @@
 
 This repository maintains the code for MaskLID: Code-Switching Language Identification through Iterative Masking (ACL-main 2024).
 
+MaskLID is a simple, yet effective, code-switching (CS) language identification (LID) method. MaskLID does not require any training and is designed to complement current high-performance sentence-level LIDs. Sentence-level LIDs are classifiers trained on monolingual texts to provide single labels, typically using a softmax layer to turn scores into probabilities. However, in cases where a sentence is composed in both L1 and L2 languages, the LID classifier often only returns the dominant label L1. To address this limitation, MaskLID employs a strategy to **mask** text features associated with L1, allowing the LID to classify the text as L2 in the next round. This method uses the LID itself to identify the features that require masking and does not rely on any external resource.
+
+
+## Demo Gradio
+
+
+We host a demo of MaskLID with GlotLID on Hugging Face: https://huggingface.co/spaces/cis-lmu/MaskLID. You can control the parameters and see the effects.
+
+
 ## Code Python 
 
 ```python
