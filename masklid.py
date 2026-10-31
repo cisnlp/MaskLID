@@ -1,59 +1,97 @@
-import fasttext
-import numpy as np
+import contextlib
+import copy
 import re
 import string
-from copy import deepcopy
+
+import fasttext
+import numpy as np
+
+try:
+    from threadpoolctl import ThreadpoolController
+except ImportError:  # optional: without it NumPy uses its default number of BLAS threads
+    ThreadpoolController = None
+
+_CONTROLLER = None
+
+
+def _single_blas_thread():
+    """A context that runs NumPy's BLAS on one thread.
+
+    MaskLID's matrix products are small (words x labels); a multithreaded BLAS spends much
+    longer starting threads than computing them, up to 20x on many-core machines. The
+    limit applies inside MaskLID calls only.
+    """
+    global _CONTROLLER
+    if ThreadpoolController is None:
+        return contextlib.nullcontext()
+    if _CONTROLLER is None:
+        _CONTROLLER = ThreadpoolController()
+    return _CONTROLLER.limit(limits=1, user_api="blas")
+
 
 class MaskLID:
     """A class for code-switching language identification using iterative masking."""
-    
-    def __init__(self, model_path, languages=-1):
+
+    def __init__(self, model_path, languages=-1, renormalize=False, cache_size=200000):
         """Initialize the MaskLID class.
-        
+
         Args:
             model_path (str): The path to the fastText model.
             languages (int or list, optional): The indices or list of language labels to consider. Defaults to -1.
+            renormalize (bool, optional): If True, probabilities are a softmax over the selected languages only, so
+                they sum to 1 over them. If False (the default, as in the paper), the softmax is over all labels of
+                the model and the selected labels are read from it, so a text in none of the selected languages
+                gets low probabilities for all of them.
+            cache_size (int, optional): How many word vectors to keep between calls. Defaults to 200000.
         """
         self.model = fasttext.load_model(model_path)
         self.output_matrix = self.model.get_output_matrix()
-        self.labels = self.model.get_labels()
+        self.all_labels = self.model.get_labels()
+        self.renormalize = renormalize
+        self.cache_size = cache_size
+        self._word_cache = {}
+        self._set_languages(languages)
+
+    def _set_languages(self, languages):
         self.language_indices = self._compute_language_indices(languages)
-        self.labels = [self.labels[i] for i in self.language_indices]
+        self.labels = [self.all_labels[i] for i in self.language_indices]
+
+    def with_languages(self, languages, renormalize=None):
+        """A MaskLID limited to `languages` that shares the loaded model (and its word cache) with this one.
+
+        Args:
+            languages (int or list): As in __init__.
+            renormalize (bool, optional): As in __init__; defaults to this object's setting.
+
+        Returns:
+            MaskLID: The new object; this one is not changed.
+        """
+        other = copy.copy(self)
+        other._set_languages(languages)
+        if renormalize is not None:
+            other.renormalize = renormalize
+        return other
 
     def _compute_language_indices(self, languages):
         """Compute indices of selected languages.
-        
+
         Args:
             languages (int or list): The indices or list of language labels.
-            
+
         Returns:
             list: Indices of selected languages.
         """
         if languages != -1 and isinstance(languages, list):
-            return [self.labels.index(l) for l in set(languages) if l in self.labels]
-        return list(range(len(self.labels)))
+            return [self.all_labels.index(l) for l in set(languages) if l in self.all_labels]
+        return list(range(len(self.all_labels)))
 
     def _softmax(self, x):
-        """Compute softmax values for each score in array x.
-        
-        Args:
-            x (numpy.ndarray): Input array.
-            
-        Returns:
-            numpy.ndarray: Softmax output.
-        """
+        """Compute softmax values for each score in array x."""
         exp_x = np.exp(x - np.max(x))
         return exp_x / np.sum(exp_x)
 
     def _normalize_text(self, text):
-        """Normalize input text.
-        
-        Args:
-            text (str): Input text.
-            
-        Returns:
-            str: Normalized text.
-        """
+        """Normalize input text: digits and '\\n_:•#{|}' become spaces, white space is squeezed."""
         replace_by = " "
         replacement_map = {ord(c): replace_by for c in '\n_:' + '•#{|}' + string.digits}
         text = text.translate(replacement_map)
@@ -61,132 +99,110 @@ class MaskLID:
 
     def predict(self, text, k=1):
         """Predict the language of the input text.
-        
+
         Args:
             text (str): Input text.
             k (int, optional): Number of top predictions to retrieve. Defaults to 1.
-            
+
         Returns:
             tuple: Top predicted labels and their probabilities.
         """
-        sentence_vector = self.model.get_sentence_vector(text)
-        result_vector = np.dot(self.output_matrix, sentence_vector)
-        softmax_result = self._softmax(result_vector)[self.language_indices]
+        with _single_blas_thread():
+            return self._predict(text, k)
+
+    def _predict(self, text, k=1):
+        result_vector = np.dot(self.output_matrix, self.model.get_sentence_vector(text))
+        if self.renormalize:
+            softmax_result = self._softmax(result_vector[self.language_indices])
+        else:
+            softmax_result = self._softmax(result_vector)[self.language_indices]
         top_k_indices = np.argsort(softmax_result)[-k:][::-1]
         top_k_labels = [self.labels[i] for i in top_k_indices]
         top_k_probs = softmax_result[top_k_indices]
         return tuple(top_k_labels), top_k_probs
 
-    def compute_v(self, sentence_vector):
-        """Compute the language vectors for a given sentence vector.
-        
+    def _word_vector(self, word):
+        """Sum of the input vectors of a word's features (its id if in the dictionary, and its n-grams)."""
+        v = self._word_cache.get(word)
+        if v is None:
+            ids = self.model.get_subwords(word)[1]
+            v = np.sum([self.model.get_input_vector(i) for i in ids], axis=0)
+            if len(self._word_cache) >= self.cache_size:
+                self._word_cache.clear()
+            self._word_cache[word] = v
+        return v
+
+    def compute_v_per_word(self, text):
+        """Compute language logits for each word in the input text.
+
         Args:
-            sentence_vector (numpy.ndarray): Sentence vector.
-            
+            text (str): Input text.
+
         Returns:
-            list: Sorted list of labels and their associated vectors.
+            dict: For every word ("index_word"), its labels and logits sorted by logit, highest first.
+        """
+        words, scores = self._word_scores(text)
+        order = np.argsort(-scores, axis=1, kind="stable") if len(words) else scores
+        return {"%d_%s" % (i, w): {"logits": [(self.labels[j], scores[i, j]) for j in order[i]]}
+                for i, w in enumerate(words)}
+
+    def _word_scores(self, text):
+        words = [w for w in self.model.get_line(self._normalize_text(text))[0] if w != '</s>']
+        if not words:
+            return words, np.zeros((0, len(self.language_indices)))
+        vectors = np.stack([self._word_vector(w) for w in words])
+        return words, vectors @ self.output_matrix[self.language_indices].T
+
+    def compute_v(self, sentence_vector):
+        """Compute the language logits for a given sentence vector.
+
+        Returns:
+            list: (label, logit) pairs sorted by logit, highest first.
         """
         result_vector = np.dot(self.output_matrix[self.language_indices, :], sentence_vector)
         return sorted(zip(self.labels, result_vector), key=lambda x: x[1], reverse=True)
 
-    def compute_v_per_word(self, text):
-        """Compute language vectors for each word in the input text.
-        
-        Args:
-            text (str): Input text.
-            
-        Returns:
-            dict: Dictionary containing language vectors for each word.
-        """
-        text = self._normalize_text(text)
-        words = self.model.get_line(text)[0]
-        words = [w for w in words if w not in ['</s>', '</s>']]
-        subword_ids = [self.model.get_subwords(sw)[1] for sw in words]
-        sentence_vector = [np.sum([self.model.get_input_vector(id) for id in sid], axis=0) for sid in subword_ids]
-
-        dict_text = {}
-        for i, word in enumerate(words):
-            key = f"{i}_{word}"
-            dict_text[key] = {'logits': self.compute_v(sentence_vector[i])}
-
-        return dict_text
-
     def mask_label_top_k(self, dict_text, label, top_keep, top_remove):
-        """Mask top predictions for a given label.
-        
-        Args:
-            dict_text (dict): Dictionary containing language vectors for each word.
-            label (str): Label to mask.
-            top_keep (int): Number of top predictions to keep.
-            top_remove (int): Number of top predictions to remove.
-            
+        """Mask top predictions for a given label (on the output of compute_v_per_word).
+
         Returns:
             tuple: Dictionaries of remaining and deleted words after masking.
         """
-        dict_remained = deepcopy(dict_text)
+        dict_remained = dict(dict_text)
         dict_deleted = {}
-
         for key, value in dict_text.items():
-            logits = value['logits']
-            labels = [t[0] for t in logits]
-
+            labels = [t[0] for t in value['logits']]
             if label in labels[:top_keep]:
                 dict_deleted[key] = dict_remained[key]
-
             if label in labels[:top_remove]:
                 dict_remained.pop(key, None)
-
         return dict_remained, dict_deleted
 
-    @staticmethod
-    def get_sizeof(text):
-        """Compute the size of text in bytes.
-        
-        Args:
-            text (str): Input text.
-            
-        Returns:
-            int: Size of text in bytes.
-        """
-        return len(text.encode('utf-8'))
+    def sum_logits(self, dict_data, label):
+        """Compute the sum of logits for a specific label across all words."""
+        total = 0
+        for value in dict_data.values():
+            for lab, logit in value['logits']:
+                if lab == label:
+                    total += logit
+                    break
+        return total
 
     @staticmethod
     def custom_sort(word):
-        """Custom sorting function for words.
-        
-        Args:
-            word (str): Input word.
-            
-        Returns:
-            int or float: Sorted value.
-        """
+        """Sort key of an "index_word" key: its index."""
         match = re.match(r'^(\d+)_', word)
-        if match:
-            return int(match.group(1))
-        else:
-            return float('inf')  # Return infinity for words without numbers at the beginning
+        return int(match.group(1)) if match else float('inf')
 
-    def sum_logits(self, dict_data, label):
-        """Compute the sum of logits for a specific label across all words.
-        
-        Args:
-            dict_data (dict): Dictionary containing language vectors for each word.
-            label (str): Label to sum logits for.
-            
-        Returns:
-            float: Total sum of logits for the given label.
-        """
-        total = 0
-        for value in dict_data.values():
-            logits = value['logits']
-            labels = [t[0] for t in logits]
-            if label in labels:
-                total += logits[labels.index(label)][1]
-        return total
+    @staticmethod
+    def get_sizeof(text):
+        """Compute the size of text in bytes."""
+        return len(text.encode('utf-8'))
 
-    def predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda=1, max_retry=3, alpha_step_increase=5, beta_step_increase=5):
+    def predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda=1, max_retry=3,
+                           alpha_step_increase=5, beta_step_increase=5):
         """Predict language switching points in the input text.
-        
+
         Args:
             text (str): Input text.
             beta (int): Number of top predictions to keep.
@@ -198,49 +214,50 @@ class MaskLID:
             alpha_step_increase (int, optional): Step increase for alpha. Defaults to 5.
             beta_step_increase (int, optional): Step increase for beta. Defaults to 5.
         Returns:
-            dict: Predicted language switching points and associated information.
+            dict: Predicted languages and the words assigned to each.
         """
-        info = {}
+        with _single_blas_thread():
+            return self._predict_codeswitch(text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
+                                            alpha_step_increase, beta_step_increase)
+
+    def _predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
+                            alpha_step_increase, beta_step_increase):
+        # Every word's labels ranked by logit (highest first; ties in label order). Only the
+        # ranks that alpha and beta can reach over all retries are needed.
+        words, scores = self._word_scores(text)
+        depth = max(beta + max_retry * beta_step_increase, alpha + max_retry * alpha_step_increase)
+        order = np.argsort(-scores, axis=1, kind="stable")[:, :depth]
+        position = {label: i for i, label in enumerate(self.labels)}
+        remaining = np.ones(len(words), dtype=bool)
+
+        info = []
         index = 0
         retry = 0
-
-        # compute v
-        dict_data = self.compute_v_per_word(text)
-
         while index < max_lambda and retry < max_retry:
-            
+
             # predict the text
-            pred = self.predict(text, k=1)
-            label = pred[0][0]
-            
+            label = self._predict(text, k=1)[0][0]
+
             # save the current text in case of step back
             prev_text = text
-            # mask
-            dict_data, dict_masked = self.mask_label_top_k(dict_data, label, beta, alpha)
+            # mask: words with the label in their top beta are assigned to it, words with it
+            # in their top alpha are removed from the text
+            p = position[label]
+            masked = remaining & (order[:, :beta] == p).any(1)
+            remaining = remaining & ~(order[:, :alpha] == p).any(1)
+            masked_text = ' '.join(w for w, m in zip(words, masked) if m)
+            text = ' '.join(w for w, r in zip(words, remaining) if r)
 
-            # get the text from the masked text and remained text
-            masked_text = ' '.join(x.split('_', 1)[1] for x in dict_masked.keys())
-            text = ' '.join(x.split('_', 1)[1] for x in dict_data.keys())
-            
             # save info
+            accepted = False
             if self.get_sizeof(masked_text) > min_length or index == 0:
-                temp_pred = self.predict(masked_text)
-
-                if (temp_pred[1][0] > min_prob and temp_pred[0][0] == label) or index == 0:
-                    info[index] = {
-                        'label': label,
-                        'text': masked_text,
-                        'text_keys': dict_masked.keys(),
-                        'size': self.get_sizeof(masked_text),
-                        'sum_logit': self.sum_logits(dict_masked, label)
-                    }
-                    index += 1
-                else:
-                    text = prev_text
-                    beta += beta_step_increase
-                    alpha += alpha_step_increase
-                    retry += 1
+                temp_pred = self._predict(masked_text)
+                accepted = (temp_pred[1][0] > min_prob and temp_pred[0][0] == label) or index == 0
+            if accepted:
+                info.append((label, np.nonzero(masked)[0]))
+                index += 1
             else:
+                # step back: the text is restored (the masked words stay removed)
                 text = prev_text
                 beta += beta_step_increase
                 alpha += alpha_step_increase
@@ -249,19 +266,8 @@ class MaskLID:
             if self.get_sizeof(text) < min_length:
                 break
 
-        
-        # post-process 
+        # post-process: the words of each label, in text order
         post_info = {}
-        for value in info.values():
-            key = value['label']
-            if key in post_info:
-                post_info[key].extend(value['text_keys'])
-            else:
-                post_info[key] = list(value['text_keys'])
-
-        # join sorted the text from list of keys
-        for key in post_info:
-            post_info[key] = ' '.join([x.split('_', 1)[1] for x in sorted(set(post_info[key]), key=self.custom_sort)])
-                
-                
-        return post_info
+        for label, indices in info:
+            post_info.setdefault(label, set()).update(int(i) for i in indices)
+        return {label: ' '.join(words[i] for i in sorted(indices)) for label, indices in post_info.items()}

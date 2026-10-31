@@ -16,13 +16,14 @@ We host a demo of MaskLID with GlotLID on Hugging Face: https://huggingface.co/s
 ## Code Python 
 
 ```python
-# !pip install fasttext
-# !pip install numpy
+# !pip install fasttext-turbo numpy threadpoolctl
 
 # !wget https://raw.githubusercontent.com/cisnlp/MaskLID/main/masklid.py
 # !wget https://huggingface.co/cis-lmu/glotlid/resolve/main/model_v3.bin
 
 ```
+
+[fastText-turbo](https://github.com/CommonGlot/fastText-turbo) is a drop-in replacement for `fasttext` (same `import fasttext`, same models) with faster prediction, and it works with NumPy 1 and 2. The original `fasttext` package works too; uninstall it before installing fasttext-turbo, as both provide the `fasttext` module. `threadpoolctl` is optional: with it, MaskLID runs NumPy's BLAS on one thread inside its calls, which is much faster for its small matrix products on machines with many cores.
 
 ```python
 # masklid is the name of masklid.py
@@ -47,6 +48,27 @@ ans
  '__label__eng_Latn': 'film falling in love at coffee shop'}
 ```
 
+
+### Changing the languages without reloading the model
+
+`with_languages` returns a MaskLID limited to other languages that shares the loaded model (and its cache of word vectors) with the first one, so there is no need to load the model again:
+
+```python
+all_glotlid = MaskLID(model_path)                       # all labels
+flores_model = all_glotlid.with_languages(flores_glotlid)
+two_model = all_glotlid.with_languages(['__label__tur_Latn', '__label__eng_Latn'])
+```
+
+### Probabilities over the selected languages
+
+By default (as in the paper), `predict` takes the softmax over all labels of the model and then reads the selected languages from it. A text in none of the selected languages therefore gets low probabilities for all of them, and `min_prob` rejects it. With `renormalize=True`, the softmax is computed over the selected languages only, so their probabilities sum to 1 (contributed by [@jradola](https://github.com/jradola) in [#1](https://github.com/cisnlp/MaskLID/pull/1)):
+
+```python
+MaskLID(model_path, languages=flores_glotlid, renormalize=True)
+# or: all_glotlid.with_languages(flores_glotlid, renormalize=True)
+```
+
+Use it when the text is known to be in one of the selected languages; keep the default when it may not be, since renormalized probabilities are high even for text in none of them.
 
 ## Citation
 
