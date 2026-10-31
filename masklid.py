@@ -36,7 +36,8 @@ class MaskLID:
         """Initialize the MaskLID class.
 
         Args:
-            model_path (str): The path to the fastText model.
+            model_path (str or fastText model): The path to the fastText model, or a model already loaded with
+                fasttext.load_model (it is used as is, not copied).
             languages (int or list, optional): The indices or list of language labels to consider. Defaults to -1.
             renormalize (bool, optional): If True, probabilities are a softmax over the selected languages only, so
                 they sum to 1 over them. If False (the default, as in the paper), the softmax is over all labels of
@@ -44,7 +45,7 @@ class MaskLID:
                 gets low probabilities for all of them.
             cache_size (int, optional): How many word vectors to keep between calls. Defaults to 200000.
         """
-        self.model = fasttext.load_model(model_path)
+        self.model = fasttext.load_model(model_path) if isinstance(model_path, str) else model_path
         self.output_matrix = self.model.get_output_matrix()
         self.all_labels = self.model.get_labels()
         self.renormalize = renormalize
@@ -200,7 +201,7 @@ class MaskLID:
         return len(text.encode('utf-8'))
 
     def predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda=1, max_retry=3,
-                           alpha_step_increase=5, beta_step_increase=5):
+                           alpha_step_increase=5, beta_step_increase=5, return_words=False):
         """Predict language switching points in the input text.
 
         Args:
@@ -213,15 +214,18 @@ class MaskLID:
             max_retry (int, optional): Maximum number of retries. Defaults to 3.
             alpha_step_increase (int, optional): Step increase for alpha. Defaults to 5.
             beta_step_increase (int, optional): Step increase for beta. Defaults to 5.
+            return_words (bool, optional): Also return the words of the (normalized) text and, for each, the
+                first label it was assigned to (None if none). Defaults to False.
         Returns:
-            dict: Predicted languages and the words assigned to each.
+            dict: Predicted languages and the words assigned to each; with return_words, a tuple
+            (that dict, words, labels of the words).
         """
         with _single_blas_thread():
             return self._predict_codeswitch(text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
-                                            alpha_step_increase, beta_step_increase)
+                                            alpha_step_increase, beta_step_increase, return_words)
 
     def _predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
-                            alpha_step_increase, beta_step_increase):
+                            alpha_step_increase, beta_step_increase, return_words=False):
         # Every word's labels ranked by logit (highest first; ties in label order). Only the
         # ranks that alpha and beta can reach over all retries are needed.
         words, scores = self._word_scores(text)
@@ -270,4 +274,12 @@ class MaskLID:
         post_info = {}
         for label, indices in info:
             post_info.setdefault(label, set()).update(int(i) for i in indices)
-        return {label: ' '.join(words[i] for i in sorted(indices)) for label, indices in post_info.items()}
+        result = {label: ' '.join(words[i] for i in sorted(indices)) for label, indices in post_info.items()}
+        if not return_words:
+            return result
+        word_labels = [None] * len(words)
+        for label, indices in info:
+            for i in indices:
+                if word_labels[i] is None:
+                    word_labels[i] = label
+        return result, words, word_labels

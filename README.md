@@ -59,6 +59,17 @@ flores_model = all_glotlid.with_languages(flores_glotlid)
 two_model = all_glotlid.with_languages(['__label__tur_Latn', '__label__eng_Latn'])
 ```
 
+### Using an already loaded model, and labels per word
+
+`MaskLID` also accepts a model loaded with `fasttext.load_model`, which it uses without copying, and `predict_codeswitch(..., return_words=True)` also returns the words and the label each was assigned to (None for words no language took):
+
+```python
+import fasttext
+ft = fasttext.load_model(model_path)
+masklid_model = MaskLID(ft)
+ans, words, labels = masklid_model.predict_codeswitch(text, beta=20, alpha=3, max_lambda=3, min_length=10, min_prob=0.90, return_words=True)
+```
+
 ### Probabilities over the selected languages
 
 By default (as in the paper), `predict` takes the softmax over all labels of the model and then reads the selected languages from it. A text in none of the selected languages therefore gets low probabilities for all of them, and `min_prob` rejects it. With `renormalize=True`, the softmax is computed over the selected languages only, so their probabilities sum to 1 (contributed by [@jradola](https://github.com/jradola) in [#1](https://github.com/cisnlp/MaskLID/pull/1)):
