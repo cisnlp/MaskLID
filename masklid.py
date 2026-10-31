@@ -112,6 +112,8 @@ class MaskLID:
             return self._predict(text, k)
 
     def _predict(self, text, k=1):
+        # fastText's sentence vector takes one line; line breaks count as spaces, as in the words of the text
+        text = text.replace('\r', ' ').replace('\n', ' ')
         result_vector = np.dot(self.output_matrix, self.model.get_sentence_vector(text))
         if self.renormalize:
             softmax_result = self._softmax(result_vector[self.language_indices])
