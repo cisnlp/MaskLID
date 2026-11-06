@@ -8,6 +8,18 @@ import unicodedata
 import fasttext
 import numpy as np
 
+try:  # GlotScript >= 2.1 (pip install -U GlotScript): scripts of words, for assign="switch" with scripts=True
+    from GlotScript import script_covers as _script_covers
+    from GlotScript import word_scripts as _word_scripts
+except ImportError:
+    _word_scripts = _script_covers = None
+
+
+def _script_fits(word_script, label):
+    """Whether a label (__label__xxx_Scrp) is written in the script GlotScript found for a word (Jpan covers Han,
+    Hiragana and Katakana, Kore covers Hangul and Han, and so on: GlotScript's script_covers)."""
+    return _script_covers(label.rsplit("_", 1)[-1], word_script)
+
 try:
     from threadpoolctl import ThreadpoolController
 except ImportError:  # optional: without it NumPy uses its default number of BLAS threads
@@ -17,11 +29,14 @@ _CONTROLLER = None
 
 # Recommended settings, tuned on the dev split of cis-lmu/cs-lid-eval with GlotLID v4 and all its labels.
 # BALANCED: the best exact match over code-switched and monolingual sentences; CAUTIOUS: fewer false code-switches
-# on monolingual text. Use as masklid_model.predict_codeswitch(text, **MASKLID_BALANCED).
+# on monolingual text. Use as masklid_model.predict_codeswitch(text, **MASKLID_BALANCED). Both use the words'
+# scripts and need GlotScript >= 2.1 (pip install -U GlotScript).
 MASKLID_BALANCED = dict(beta=20, alpha=5, max_lambda=3, min_length=1, min_prob=0.3, max_retry=3,
-                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6)
+                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6,
+                        scripts=True)
 MASKLID_CAUTIOUS = dict(beta=20, alpha=3, max_lambda=3, min_length=10, min_prob=0.9, max_retry=3,
-                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6)
+                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6,
+                        scripts=True)
 
 
 # Numbers, punctuation and symbols belong to no language (Unicode categories N*, P*, S*): they are split off at the
@@ -261,7 +276,7 @@ class MaskLID:
 
     def predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda=1, max_retry=3,
                            alpha_step_increase=5, beta_step_increase=5, return_words=False, assign="mask",
-                           switch_penalty=4.0, min_chars=6):
+                           switch_penalty=4.0, min_chars=6, scripts=False):
         """Predict language switching points in the input text.
 
         Args:
@@ -283,6 +298,9 @@ class MaskLID:
                 `min_chars` characters.
             switch_penalty (float, optional): Cost of a language change for assign="switch". Defaults to 4.0.
             min_chars (int, optional): Characters a language needs for assign="switch". Defaults to 6.
+            scripts (bool, optional): For assign="switch", use GlotScript (>= 2.1) to give each word only a
+                language written in its script, and to add a language for a script none of the found languages
+                is written in (predicted on that script's words, among labels of that script). Defaults to False.
         Returns:
             dict: Predicted languages and the words assigned to each; with return_words, a tuple
             (that dict, words, labels of the words).
@@ -292,8 +310,10 @@ class MaskLID:
                 raise ValueError('assign must be "mask" or "switch"')
             out = self._predict_codeswitch(text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
                                            alpha_step_increase, beta_step_increase, return_words=True)
+            if scripts and _word_scripts is None:
+                raise ImportError("scripts=True needs GlotScript >= 2.1: pip install -U GlotScript")
             if assign == "switch":
-                out = self._switch_assign(out, switch_penalty, min_chars)
+                out = self._switch_assign(out, switch_penalty, min_chars, scripts)
             return out if return_words else out[0]
 
     def _word_logp(self, word):
@@ -309,7 +329,7 @@ class MaskLID:
             self._word_cache[key] = v
         return v
 
-    def _switch_assign(self, out, penalty, min_chars):
+    def _switch_assign(self, out, penalty, min_chars, scripts=False):
         """Assign every word to one of the languages MaskLID found (all selected languages if it found none), with
         the best sum of word log-probabilities minus `penalty` per change of language (Viterbi). With one penalty for
         every change, a label's best predecessor is itself or the overall best label, so this is O(words x labels)."""
@@ -320,14 +340,35 @@ class MaskLID:
         words = [tokens[i] for i in pos]
         if not words:
             return {}, tokens, [None] * len(tokens)
-        score = self._word_logp(words[0])[allowed].copy()
+        fit = None
+        if scripts:
+            wscript = [_word_scripts(w)[0][1] if w.strip() else "Zyyy" for w in words]
+            found = [self.all_labels[i] for i in allowed]
+            extra = set()
+            for sc in sorted({x for x in wscript if x not in ("Zyyy", "Zinh", "Zzzz")}):
+                if not any(_script_fits(sc, l) for l in found):
+                    # no found language is written in this script: predict its words among labels of the script
+                    cand = [i for i in self.language_indices if _script_fits(sc, self.all_labels[i])]
+                    if cand:
+                        text_sc = " ".join(w for w, x in zip(words, wscript) if x == sc)
+                        s_ = self.output_matrix[cand] @ self.model.get_sentence_vector(text_sc)
+                        extra.add(int(cand[int(np.argmax(s_))]))
+            if extra:
+                allowed = np.array(sorted(set(allowed.tolist()) | extra))
+            labs = [self.all_labels[i] for i in allowed]
+            fit = []
+            for x in wscript:
+                m = np.array([x in ("Zyyy", "Zinh", "Zzzz") or _script_fits(x, l) for l in labs])
+                fit.append(m if m.any() else np.ones(len(labs), dtype=bool))  # no label of its script: all
+        emit = lambda k: self._word_logp(words[k])[allowed] if fit is None else np.where(fit[k], self._word_logp(words[k])[allowed], -np.inf)
+        score = emit(0).copy()
         back = []
-        for w in words[1:]:
+        for k in range(1, len(words)):
             best = int(np.argmax(score))
             switch = score[best] - penalty
             stay = score >= switch
             back.append(np.where(stay, np.arange(len(score)), best))
-            score = np.where(stay, score, switch) + self._word_logp(w)[allowed]
+            score = np.where(stay, score, switch) + emit(k)
         path = [int(np.argmax(score))]
         for b in reversed(back):
             path.append(int(b[path[-1]]))
@@ -336,6 +377,11 @@ class MaskLID:
         for w, l in zip(words, labels):
             chars[l] = chars.get(l, 0) + len(w)
         keep = {l for l, c in chars.items() if c >= min_chars} or {max(chars, key=chars.get)}
+        if fit is not None:  # a language that is the only one of its words' script is kept whatever its length
+            labs = [self.all_labels[i] for i in allowed]
+            for k, l in enumerate(labels):
+                if fit[k].sum() == 1 and l == labs[int(np.argmax(fit[k]))]:
+                    keep.add(l)
         token_labels = [None] * len(tokens)
         for i, l in zip(pos, labels):
             token_labels[i] = l if l in keep else None

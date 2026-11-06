@@ -17,6 +17,8 @@ We host a demo of MaskLID with GlotLID on Hugging Face, in the **Code-Switching 
 
 ```python
 # !pip install fasttext-turbo numpy threadpoolctl
+# !pip install -U "GlotScript>=2.1"   # for scripts=True (used by the presets); until it is on PyPI:
+# !pip install "GlotScript @ git+https://github.com/cisnlp/GlotScript"
 
 # !wget https://raw.githubusercontent.com/cisnlp/MaskLID/main/masklid.py
 # !wget https://huggingface.co/cis-lmu/glotlid/resolve/main/model_v4.bin
@@ -65,7 +67,15 @@ ans = masklid_model.predict_codeswitch(text, **MASKLID_BALANCED)
 # MASKLID_BALANCED: beta=20, alpha=5, min_length=1, min_prob=0.3, assign="switch", switch_penalty=4, min_chars=6
 # MASKLID_CAUTIOUS: the paper's beta=20, alpha=3, min_length=10, min_prob=0.9 with assign="switch": fewer false
 #                   code-switches on monolingual text
+# both presets set scripts=True (GlotScript >= 2.1)
 ```
+
+With `scripts=True`, [GlotScript](https://github.com/cisnlp/GlotScript) gives the script of every word: a word only gets a
+language written in its script (Han characters go to Chinese, Japanese or Korean labels, Latin words to Latin-script
+labels), and a script that none of the found languages is written in gets a language of its own, predicted on that
+script's words among labels of the script. A language that is the only one of its words' script is kept whatever its
+length. On the test split below this raises the exact match on Chinese-English from 36.1 to 69.3 (CodeMixBench) and
+from 58.9 to 60.9 (ASCEND), and leaves the subsets with one script unchanged.
 
 Results on the test split of [cis-lmu/cs-lid-eval](https://huggingface.co/datasets/cis-lmu/cs-lid-eval) (30 subsets:
 11 original code-switching corpora, CodeMixBench's 10 LID sets and ILP4LID's 9 sets with its monolingual controls),
@@ -75,8 +85,11 @@ GlotLID v4, settings chosen on its dev split; exact match (EM) of the language s
 | setting | EM all | EM code-switched | EM monolingual | word macro F1 | unassigned words |
 |---|---|---|---|---|---|
 | MaskLID, paper settings, 200 most frequent labels | 35.4 | 34.2 | 71.6 | 44.0 | 26.5% |
-| `MASKLID_CAUTIOUS` | 39.8 | 38.1 | **88.7** | 57.4 | 1.7% |
-| `MASKLID_BALANCED` | **46.3** | **45.2** | 77.7 | **63.5** | 1.7% |
+| `MASKLID_CAUTIOUS` without scripts | 39.8 | 38.1 | **88.7** | 57.4 | 1.7% |
+| `MASKLID_BALANCED` without scripts | 46.3 | 45.2 | 77.7 | 63.5 | 1.7% |
+| `MASKLID_BALANCED` (`scripts=True`) | **47.4** | **46.3** | 77.7 | | |
+
+(Word macro F1 with `scripts=True` rises by 1.0 point over the same run without it; on Chinese-English from 61.9 to 79.7.)
 
 ### Numbers, punctuation and symbols
 
