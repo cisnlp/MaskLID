@@ -67,16 +67,16 @@ ans = masklid_model.predict_codeswitch(text, **MASKLID_BALANCED)
 #                   code-switches on monolingual text
 ```
 
-Results on the test split of [cis-lmu/cs-lid-eval](https://huggingface.co/datasets/cis-lmu/cs-lid-eval) (19 subsets:
-10 with word-level labels from CodeMixBench, 8 code-switched sets and the monolingual controls of ILP4LID), GlotLID
-v4, settings chosen on its dev split; exact match (EM) of the language set and macro F1 of the word labels, macro
-averages over subsets:
+Results on the test split of [cis-lmu/cs-lid-eval](https://huggingface.co/datasets/cis-lmu/cs-lid-eval) (30 subsets:
+11 original code-switching corpora, CodeMixBench's 10 LID sets and ILP4LID's 9 sets with its monolingual controls),
+GlotLID v4, settings chosen on its dev split; exact match (EM) of the language set and macro F1 of the word labels
+(on the 18 subsets with word labels), macro averages over subsets:
 
 | setting | EM all | EM code-switched | EM monolingual | word macro F1 | unassigned words |
 |---|---|---|---|---|---|
-| MaskLID, paper settings, 200 most frequent labels | 31.7 | 29.5 | 71.6 | 43.0 | 25.9% |
-| `MASKLID_CAUTIOUS` | 35.2 | 32.2 | 88.7 | 53.4 | 3.0% |
-| `MASKLID_BALANCED` | **41.0** | **39.0** | 77.7 | **59.0** | 3.0% |
+| MaskLID, paper settings, 200 most frequent labels | 35.4 | 34.2 | 71.6 | 44.0 | 26.5% |
+| `MASKLID_CAUTIOUS` | 39.8 | 38.1 | **88.7** | 57.4 | 1.7% |
+| `MASKLID_BALANCED` | **46.3** | **45.2** | 77.7 | **63.5** | 1.7% |
 
 ### Numbers, punctuation and symbols
 
