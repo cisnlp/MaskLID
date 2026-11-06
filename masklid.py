@@ -3,6 +3,8 @@ import copy
 import re
 import string
 
+import unicodedata
+
 import fasttext
 import numpy as np
 
@@ -12,6 +14,61 @@ except ImportError:  # optional: without it NumPy uses its default number of BLA
     ThreadpoolController = None
 
 _CONTROLLER = None
+
+# Recommended settings, tuned on the dev split of cis-lmu/cs-lid-eval with GlotLID v4 and all its labels.
+# BALANCED: the best exact match over code-switched and monolingual sentences; CAUTIOUS: fewer false code-switches
+# on monolingual text. Use as masklid_model.predict_codeswitch(text, **MASKLID_BALANCED).
+MASKLID_BALANCED = dict(beta=20, alpha=5, max_lambda=3, min_length=1, min_prob=0.3, max_retry=3,
+                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6)
+MASKLID_CAUTIOUS = dict(beta=20, alpha=3, max_lambda=3, min_length=10, min_prob=0.9, max_retry=3,
+                        alpha_step_increase=3, beta_step_increase=5, assign="switch", switch_penalty=4.0, min_chars=6)
+
+
+# Numbers, punctuation and symbols belong to no language (Unicode categories N*, P*, S*): they are split off at the
+# start and end of a word, never used to identify a language, and shown without a label.
+import unicodedata
+
+def is_neutral(ch):
+    return unicodedata.category(ch)[0] in "NPS"
+
+
+def _is_number(ch):
+    return unicodedata.category(ch)[0] == "N"
+
+
+def _split_neutral(s):
+    """Cut a run of neutral characters into number tokens and punctuation tokens."""
+    out, cur, cur_num = [], "", None
+    for i, ch in enumerate(s):
+        num = _is_number(ch) or (cur_num and 0 < i < len(s) - 1 and _is_number(s[i + 1]))  # 3.5, 1,000, 12:30
+        if cur and num != cur_num:
+            out.append(cur)
+            cur = ""
+        cur, cur_num = cur + ch, num
+    if cur:
+        out.append(cur)
+    return out
+
+
+def tokenize(text):
+    """[(token, neutral)] in text order; white space separates chunks and is dropped."""
+    tokens = []
+    for chunk in text.split():
+        idx = [i for i, ch in enumerate(chunk) if not is_neutral(ch)]
+        if not idx:
+            tokens += [(t, True) for t in _split_neutral(chunk)]
+            continue
+        a, b = idx[0], idx[-1] + 1
+        tokens += [(t, True) for t in _split_neutral(chunk[:a])]
+        tokens.append((chunk[a:b], False))
+        tokens += [(t, True) for t in _split_neutral(chunk[b:])]
+    return tokens
+
+
+def language_text(text):
+    """The words of the text without the numbers, punctuation and symbols around them, one space apart."""
+    return " ".join(t for t, n in tokenize(text) if not n)
+
 
 
 def _single_blas_thread():
@@ -203,7 +260,8 @@ class MaskLID:
         return len(text.encode('utf-8'))
 
     def predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda=1, max_retry=3,
-                           alpha_step_increase=5, beta_step_increase=5, return_words=False):
+                           alpha_step_increase=5, beta_step_increase=5, return_words=False, assign="mask",
+                           switch_penalty=4.0, min_chars=6):
         """Predict language switching points in the input text.
 
         Args:
@@ -216,21 +274,87 @@ class MaskLID:
             max_retry (int, optional): Maximum number of retries. Defaults to 3.
             alpha_step_increase (int, optional): Step increase for alpha. Defaults to 5.
             beta_step_increase (int, optional): Step increase for beta. Defaults to 5.
-            return_words (bool, optional): Also return the words of the (normalized) text and, for each, the
-                first label it was assigned to (None if none). Defaults to False.
+            return_words (bool, optional): Also return the tokens of the text and, for each, the label it was
+                assigned to (None if none; numbers, punctuation and symbols never get one). Defaults to False.
+            assign (str, optional): "mask" (default, as in the paper): words get the language that masked them, and
+                words no round took stay unassigned. "switch": MaskLID only finds the languages; then every word is
+                assigned to one of them, maximizing the words' log-probabilities minus `switch_penalty` for every
+                change of language between neighbouring words, and a language is kept if its words have at least
+                `min_chars` characters.
+            switch_penalty (float, optional): Cost of a language change for assign="switch". Defaults to 4.0.
+            min_chars (int, optional): Characters a language needs for assign="switch". Defaults to 6.
         Returns:
             dict: Predicted languages and the words assigned to each; with return_words, a tuple
             (that dict, words, labels of the words).
         """
         with _single_blas_thread():
-            return self._predict_codeswitch(text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
-                                            alpha_step_increase, beta_step_increase, return_words)
+            if assign not in ("mask", "switch"):
+                raise ValueError('assign must be "mask" or "switch"')
+            out = self._predict_codeswitch(text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
+                                           alpha_step_increase, beta_step_increase, return_words=True)
+            if assign == "switch":
+                out = self._switch_assign(out, switch_penalty, min_chars)
+            return out if return_words else out[0]
+
+    def _word_logp(self, word):
+        """Log-probabilities of all labels of the model for a word on its own."""
+        key = ("logp", word)
+        v = self._word_cache.get(key)
+        if v is None:
+            s = self.output_matrix @ self.model.get_sentence_vector(word)
+            s = s - s.max()
+            v = s - np.log(np.exp(s).sum())
+            if len(self._word_cache) >= self.cache_size:
+                self._word_cache.clear()
+            self._word_cache[key] = v
+        return v
+
+    def _switch_assign(self, out, penalty, min_chars):
+        """Assign every word to one of the languages MaskLID found (all selected languages if it found none), with
+        the best sum of word log-probabilities minus `penalty` per change of language (Viterbi). With one penalty for
+        every change, a label's best predecessor is itself or the overall best label, so this is O(words x labels)."""
+        result, tokens, token_labels = out
+        index = {l: i for i, l in enumerate(self.all_labels)}
+        allowed = np.array(sorted(index[l] for l in result) if result else self.language_indices)
+        pos = [i for i, (t, n) in enumerate(zip(tokens, token_labels)) if not all(is_neutral(c) for c in t)]
+        words = [tokens[i] for i in pos]
+        if not words:
+            return {}, tokens, [None] * len(tokens)
+        score = self._word_logp(words[0])[allowed].copy()
+        back = []
+        for w in words[1:]:
+            best = int(np.argmax(score))
+            switch = score[best] - penalty
+            stay = score >= switch
+            back.append(np.where(stay, np.arange(len(score)), best))
+            score = np.where(stay, score, switch) + self._word_logp(w)[allowed]
+        path = [int(np.argmax(score))]
+        for b in reversed(back):
+            path.append(int(b[path[-1]]))
+        labels = [self.all_labels[int(allowed[i])] for i in reversed(path)]
+        chars = {}
+        for w, l in zip(words, labels):
+            chars[l] = chars.get(l, 0) + len(w)
+        keep = {l for l, c in chars.items() if c >= min_chars} or {max(chars, key=chars.get)}
+        token_labels = [None] * len(tokens)
+        for i, l in zip(pos, labels):
+            token_labels[i] = l if l in keep else None
+        order = sorted(keep, key=lambda l: min(k for k, x in enumerate(token_labels) if x == l))
+        result = {l: ' '.join(t for t, x in zip(tokens, token_labels) if x == l) for l in order}
+        return result, tokens, token_labels
 
     def _predict_codeswitch(self, text, beta, alpha, min_prob, min_length, max_lambda, max_retry,
                             alpha_step_increase, beta_step_increase, return_words=False):
+        # Numbers, punctuation and symbols belong to no language: they are split off the words they touch and never
+        # reach the model; only the words are predicted, masked and assigned (the output still shows every token).
+        tokens = tokenize(text)
+        words = [t for t, neutral in tokens if not neutral]
+        if not words:
+            return ({}, [t for t, _ in tokens], [None] * len(tokens)) if return_words else {}
+        text = ' '.join(words)
         # Every word's labels ranked by logit (highest first; ties in label order). Only the
         # ranks that alpha and beta can reach over all retries are needed.
-        words, scores = self._word_scores(text)
+        scores = np.stack([self._word_vector(w) for w in words]) @ self.output_matrix[self.language_indices].T
         depth = max(beta + max_retry * beta_step_increase, alpha + max_retry * alpha_step_increase)
         order = np.argsort(-scores, axis=1, kind="stable")[:, :depth]
         position = {label: i for i, label in enumerate(self.labels)}
@@ -284,4 +408,7 @@ class MaskLID:
             for i in indices:
                 if word_labels[i] is None:
                     word_labels[i] = label
-        return result, words, word_labels
+        # every token of the input in order; neutral tokens have no label
+        labels_iter = iter(word_labels)
+        token_labels = [None if neutral else next(labels_iter) for _, neutral in tokens]
+        return result, [t for t, _ in tokens], token_labels

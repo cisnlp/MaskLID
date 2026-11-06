@@ -10,7 +10,7 @@ MaskLID is a simple, yet effective, code-switching (CS) language identification 
 ## Demo
 
 
-We host a demo of MaskLID with GlotLID on Hugging Face, in the **Code-Switching (MaskLID)** tab of the GlotLID Space: https://huggingface.co/spaces/cis-lmu/glotlid-space. You can choose GlotLID v3 or v4 alpha, control the parameters and see the words of each language.
+We host a demo of MaskLID with GlotLID on Hugging Face, in the **Code-Switching (MaskLID)** tab of the GlotLID Space: https://huggingface.co/spaces/cis-lmu/glotlid-space. You can choose GlotLID v3 or v4, control the parameters and see the words of each language.
 
 
 ## Code Python 
@@ -19,7 +19,7 @@ We host a demo of MaskLID with GlotLID on Hugging Face, in the **Code-Switching 
 # !pip install fasttext-turbo numpy threadpoolctl
 
 # !wget https://raw.githubusercontent.com/cisnlp/MaskLID/main/masklid.py
-# !wget https://huggingface.co/cis-lmu/glotlid/resolve/main/model_v3.bin
+# !wget https://huggingface.co/cis-lmu/glotlid/resolve/main/model_v4.bin
 
 ```
 
@@ -48,6 +48,41 @@ ans
  '__label__eng_Latn': 'film falling in love at coffee shop'}
 ```
 
+
+### Recommended settings: assign every word (`assign="switch"`)
+
+With the paper's settings, MaskLID leaves words that no round took unassigned (about a quarter of the words on the
+benchmarks below), and with `min_prob=0.9` it often misses short inserts of a second language. With
+`assign="switch"`, MaskLID only finds the languages; every word is then assigned to one of them by a Viterbi pass
+that adds up the words' log-probabilities and pays `switch_penalty` for each change of language between neighbouring
+words, so short ambiguous words follow their neighbours. A language is kept if its words have at least `min_chars`
+characters. Two presets are tuned for GlotLID v4 with all its labels:
+
+```python
+from masklid import MaskLID, MASKLID_BALANCED, MASKLID_CAUTIOUS
+masklid_model = MaskLID('model_v4.bin')          # all labels
+ans = masklid_model.predict_codeswitch(text, **MASKLID_BALANCED)
+# MASKLID_BALANCED: beta=20, alpha=5, min_length=1, min_prob=0.3, assign="switch", switch_penalty=4, min_chars=6
+# MASKLID_CAUTIOUS: the paper's beta=20, alpha=3, min_length=10, min_prob=0.9 with assign="switch": fewer false
+#                   code-switches on monolingual text
+```
+
+Results on the test split of [cis-lmu/cs-lid-eval](https://huggingface.co/datasets/cis-lmu/cs-lid-eval) (19 subsets:
+10 with word-level labels from CodeMixBench, 8 code-switched sets and the monolingual controls of ILP4LID), GlotLID
+v4, settings chosen on its dev split; exact match (EM) of the language set and macro F1 of the word labels, macro
+averages over subsets:
+
+| setting | EM all | EM code-switched | EM monolingual | word macro F1 | unassigned words |
+|---|---|---|---|---|---|
+| MaskLID, paper settings, 200 most frequent labels | 31.7 | 29.5 | 71.6 | 43.0 | 25.9% |
+| `MASKLID_CAUTIOUS` | 35.2 | 32.2 | 88.7 | 53.4 | 3.0% |
+| `MASKLID_BALANCED` | **41.0** | **39.0** | 77.7 | **59.0** | 3.0% |
+
+### Numbers, punctuation and symbols
+
+Characters of the Unicode categories numbers, punctuation and symbols are split off at the start and end of a word
+(`"race car"` is `"`, `race`, `car`, `"`; `2024!` is `2024`, `!`) and never used to identify a language; inside a
+word they stay (`it's`, `de3v`). With `return_words=True` they are returned with the label `None`.
 
 ### Changing the languages without reloading the model
 
