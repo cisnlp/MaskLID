@@ -17,8 +17,7 @@ We host a demo of MaskLID with GlotLID on Hugging Face, in the **Code-Switching 
 
 ```python
 # !pip install fasttext-turbo numpy threadpoolctl
-# !pip install -U "GlotScript>=2.1"   # for scripts=True (used by the presets); until it is on PyPI:
-# !pip install "GlotScript @ git+https://github.com/cisnlp/GlotScript"
+# !pip install -U "GlotScript>=2.1"   # for scripts=True (used by the presets)
 
 # !wget https://raw.githubusercontent.com/cisnlp/MaskLID/main/masklid.py
 # !wget https://huggingface.co/cis-lmu/glotlid/resolve/main/model_v4.bin
